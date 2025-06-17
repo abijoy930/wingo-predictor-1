@@ -137,3 +137,29 @@ def live_accuracy():
 if __name__ == "__main__":
     Thread(target=prediction_loop).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    import requests
+
+TELEGRAM_TOKEN = "7751314755:AAFXmYJ2lW7xZhU7Txl1JuqCxG8LfbKmNZM"
+CHAT_ID = "6848807471"
+
+def send_prediction_to_telegram(period, number, size, color, confidence=None):
+    message = f"""
+🎯 *Wingo Prediction*
+
+🆔 Period: `{period}`
+🎲 Result: `{number}` ({size})
+🎨 Color: `{color}`
+{f'✅ Confidence: {confidence}%' if confidence else ''}
+"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {
+        "chat_id": CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
+    try:
+        response = requests.post(url, data=data)
+        print("Telegram response:", response.text)
+    except Exception as e:
+        print("Telegram error:", e)
+
