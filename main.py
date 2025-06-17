@@ -1,165 +1,198 @@
-import os
-import time
-import random
+# main.py
+
 import requests
-import numpy as np
 import pandas as pd
-from flask import Flask, jsonify
+import time
+import json
+import os
+import random
+import numpy as np
+import threading
 from datetime import datetime
-from threading import Thread
+from flask import Flask
 from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import LSTM, Dense
 from tensorflow.keras.callbacks import ModelCheckpoint
-import matplotlib.pyplot as plt
+import telegram
 
+# Telegram Config
+BOT_TOKEN = "7751314755:AAFXmYJ2lW7xZhU7Txl1JuqCxG8LfbKmNZM"
+CHAT_ID = "6848807471"
+bot = telegram.Bot(token=BOT_TOKEN)
+
+# Model Path
+MODEL_PATH = "wingo_model.h5"
+DATA_PATH = "wingo_data.csv"
+
+# App
 app = Flask(__name__)
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-MODEL_PATH = "model/lstm_model.h5"
-DATA_PATH = "data/past_results.csv"
+# ------------------------- Helper Functions -------------------------
 
-def fetch_real_data():
-    return [random.randint(0, 9) for _ in range(100)]
+def fetch_latest_result():
+    try:
+        url = "https://api.wingo.one/minuteWin/getMinuteWinLatestResult"
+        response = requests.get(url)
+        data = response.json()['data']
+        return {
+            "period": data["periodNumber"],
+            "number": int(data["number"]),
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+    except:
+        return None
 
-def send_telegram(text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": CHAT_ID, "text": text})
+def get_color(number):
+    color_map = {
+        0: "Green", 1: "Red", 2: "Violet", 3: "Green", 4: "Green",
+        5: "Red", 6: "Green", 7: "Red", 8: "Green", 9: "Red"
+    }
+    return color_map.get(number, "Unknown")
 
-def save_data(new_results):
-    if not os.path.exists("data"):
-        os.makedirs("data")
-    if os.path.exists(DATA_PATH):
-        df = pd.read_csv(DATA_PATH)
+def get_size(number):
+    if number in [0, 1, 2, 3, 4]:
+        return "Small"
     else:
-        df = pd.DataFrame(columns=["timestamp", "result"])
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    for val in new_results:
-        df = pd.concat([df, pd.DataFrame([[now, val]], columns=["timestamp", "result"])], ignore_index=True)
-    df.to_csv(DATA_PATH, index=False)
+        return "Big"
 
-def prepare_data():
+# ------------------------- Data + Training -------------------------
+
+def save_result(data):
+    new_row = {
+        "period": data["period"],
+        "number": data["number"],
+        "color": get_color(data["number"]),
+        "size": get_size(data["number"]),
+        "time": data["time"]
+    }
+    df = pd.DataFrame([new_row])
+    if os.path.exists(DATA_PATH):
+        df.to_csv(DATA_PATH, mode='a', header=False, index=False)
+    else:
+        df.to_csv(DATA_PATH, index=False)
+
+def load_data():
+    if not os.path.exists(DATA_PATH):
+        return None, None
     df = pd.read_csv(DATA_PATH)
+    df.dropna(inplace=True)
     sequence_length = 10
+    if len(df) < sequence_length + 1:
+        return None, None
     X, y = [], []
-    data = df["result"].values
-    for i in range(len(data) - sequence_length):
-        X.append(data[i:i + sequence_length])
-        y.append(data[i + sequence_length])
-    X = np.array(X).reshape(-1, 10, 1) / 9.0
+    for i in range(sequence_length, len(df)):
+        X.append(df['number'].iloc[i-sequence_length:i].values)
+        y.append(df['number'].iloc[i])
+    return np.array(X), np.array(y)
+
+def train_and_save_model():
+    X, y = load_data()
+    if X is None:
+        return
+    X = X.reshape((X.shape[0], X.shape[1], 1))
     y = np.array(y)
-    return X, y
-
-def train_model():
-    X, y = prepare_data()
     model = Sequential()
-    model.add(LSTM(64, input_shape=(10, 1)))
+    model.add(LSTM(64, return_sequences=True, input_shape=(X.shape[1], 1)))
+    model.add(LSTM(64))
     model.add(Dense(10, activation='softmax'))
-    model.compile(loss='sparse_categorical_crossentropy', optimizer='adam', metrics=['accuracy'])
-    if not os.path.exists("model"):
-        os.makedirs("model")
-    model.fit(X, y, epochs=5, batch_size=16, verbose=0)
+    model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    model.fit(X, y, epochs=10, batch_size=16, verbose=0)
     model.save(MODEL_PATH)
-    return model
 
-def load_or_train_model():
+def load_model_if_exists():
     if os.path.exists(MODEL_PATH):
         return load_model(MODEL_PATH)
-    else:
-        return train_model()
+    return None
+
+# ------------------------- Prediction + Report -------------------------
 
 def predict_next(model):
     df = pd.read_csv(DATA_PATH)
-    last_seq = df["result"].values[-10:]
-    input_seq = np.array(last_seq).reshape(1, 10, 1) / 9.0
-    prediction = model.predict(input_seq)[0]
-    confidence = np.max(prediction)
-    pred_val = np.argmax(prediction)
-    return pred_val, confidence
+    recent = df['number'].values[-10:]
+    input_seq = np.array(recent).reshape((1, 10, 1))
+    pred = model.predict(input_seq)[0]
+    number = np.argmax(pred)
+    confidence = pred[number]
+    return number, confidence
 
-def color_map(n):
-    return "Green" if n % 2 == 0 else "Red"
+def send_prediction(number, confidence):
+    size = get_size(number)
+    color = get_color(number)
+    msg = f"""📢 *Wingo Prediction*
+🕒 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+🎯 Result: {number} ({size}, {color})"""
+    bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+    if confidence >= 0.9:
+        bot.send_message(chat_id=CHAT_ID, text=f"🔔 *High Confidence Alert*\nPrediction: {number} with {round(confidence*100,2)}%", parse_mode="Markdown")
 
-def big_small(n):
-    return "Big" if n >= 5 else "Small"
-
-def prediction_loop():
-    while True:
-        try:
-            new_data = fetch_real_data()
-            save_data(new_data)
-            model = load_or_train_model()
-            pred, conf = predict_next(model)
-            color = color_map(pred)
-            size = big_small(pred)
-            msg = f"🎯 Prediction: {pred} ({size}, {color})\nConfidence: {round(conf*100,2)}%\nTime: {datetime.now().strftime('%H:%M:%S')}"
-            send_telegram(msg)
-            if conf > 0.90:
-                send_telegram(f"🚨 High Confidence Alert: {pred} is likely!\nConfidence: {round(conf*100,2)}%")
-            time.sleep(60)
-        except Exception as e:
-            print(f"Prediction Error: {e}")
-            time.sleep(30)
-
-@app.route('/')
-def home():
-    return "✅ Wingo Predictor Bot Running!"
-
-@app.route('/summary')
-def weekly_summary():
-    df = pd.read_csv(DATA_PATH)
-    last_7_days = df.tail(7*24*60)
-    msg = f"📅 Weekly Total Predictions: {len(last_7_days)}"
-    send_telegram(msg)
-    return "✅ Weekly Summary Sent!"
-
-@app.route('/pattern')
-def pattern_analyzer():
-    df = pd.read_csv(DATA_PATH)
-    df['hour'] = pd.to_datetime(df['timestamp']).dt.hour
-    common_by_hour = df.groupby('hour')['result'].agg(lambda x: x.value_counts().index[0])
-    msg = "📈 Pattern Analyzer (Top Result Per Hour):\n"
-    for hour, res in common_by_hour.items():
-        msg += f"{hour}:00 - {res}\n"
-    send_telegram(msg)
-    return "✅ Pattern Analyzed"
-
-@app.route('/accuracy')
-def live_accuracy():
+def send_accuracy_report():
+    if not os.path.exists(DATA_PATH):
+        return
     df = pd.read_csv(DATA_PATH)
     total = len(df)
-    big = len(df[df['result'] >= 5])
-    even = len(df[df['result'] % 2 == 0])
-    msg = f"📊 Live Stats:\nTotal: {total}\nBig: {round((big/total)*100,2)}%\nGreen: {round((even/total)*100,2)}%"
-    send_telegram(msg)
-    return "✅ Accuracy Report Sent"
+    big = len(df[df['size'] == 'Big'])
+    small = len(df[df['size'] == 'Small'])
+    green = len(df[df['color'] == 'Green'])
+    red = len(df[df['color'] == 'Red'])
+    msg = f"""📊 *Wingo Accuracy Summary*
+Total Results: {total}
+🟢 Green: {green} ({green*100//total}%)
+🔴 Red: {red} ({red*100//total}%)
+🔵 Big: {big} ({big*100//total}%)
+🟡 Small: {small} ({small*100//total}%)"""
+    bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+
+def send_pattern_analysis():
+    if not os.path.exists(DATA_PATH):
+        return
+    df = pd.read_csv(DATA_PATH)
+    hourly = df.copy()
+    hourly['hour'] = pd.to_datetime(hourly['time']).dt.hour
+    pattern = hourly.groupby('hour')['number'].mean().reset_index()
+    msg = "*📈 Pattern Analyzer*\n"
+    for _, row in pattern.iterrows():
+        msg += f"⏰ Hour {int(row['hour'])}: Avg = {round(row['number'], 2)}\n"
+    bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+
+# ------------------------- Background Loop -------------------------
+
+def background_predict_loop():
+    last_period = None
+    while True:
+        latest = fetch_latest_result()
+        if latest and latest["period"] != last_period:
+            save_result(latest)
+            train_and_save_model()
+            model = load_model_if_exists()
+            if model:
+                number, confidence = predict_next(model)
+                send_prediction(number, confidence)
+            last_period = latest["period"]
+        time.sleep(10)
+
+# ------------------------- Flask API -------------------------
+
+@app.route("/")
+def home():
+    return "✅ Wingo Predictor Bot is Running"
+
+@app.route("/summary")
+def summary():
+    send_accuracy_report()
+    return "📊 Summary sent to Telegram!"
+
+@app.route("/pattern")
+def pattern():
+    send_pattern_analysis()
+    return "📈 Pattern sent to Telegram!"
+
+@app.route("/accuracy")
+def accuracy():
+    send_accuracy_report()
+    return "✅ Accuracy report sent."
+
+# ------------------------- Run App -------------------------
 
 if __name__ == "__main__":
-    Thread(target=prediction_loop).start()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
-    import requests
-
-TELEGRAM_TOKEN = "7751314755:AAFXmYJ2lW7xZhU7Txl1JuqCxG8LfbKmNZM"
-CHAT_ID = "6848807471"
-
-def send_prediction_to_telegram(period, number, size, color, confidence=None):
-    message = f"""
-🎯 *Wingo Prediction*
-
-🆔 Period: `{period}`
-🎲 Result: `{number}` ({size})
-🎨 Color: `{color}`
-{f'✅ Confidence: {confidence}%' if confidence else ''}
-"""
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {
-        "chat_id": CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
-    try:
-        response = requests.post(url, data=data)
-        print("Telegram response:", response.text)
-    except Exception as e:
-        print("Telegram error:", e)
-
+    threading.Thread(target=background_predict_loop, daemon=True).start()
+    app.run(host="0.0.0.0", port=10000)
